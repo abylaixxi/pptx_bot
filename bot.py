@@ -1,96 +1,93 @@
+import os
+import io
 import logging
 import wikipediaapi
 from pptx import Presentation
-from pptx.util import Inches
+from pptx.util import Inches, Pt
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-import tempfile
-import os
-from dotenv import load_dotenv
 
-# Загружаем переменные окружения (локально для тестов, Railway использует свои)
-load_dotenv()
-TOKEN = os.getenv("TOKEN")
-
-# Логирование
+# Включаем логирование для отладки
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
-logger = logging.getLogger(__name__)
 
-# Wikipedia API (русский)
-wiki = wikipediaapi.Wikipedia('ru')
+# Читаем токен из переменных окружения Railway
+TOKEN = os.getenv("TOKEN")
 
-def create_presentation(topic: str, slides_count: int = 8) -> str:
-    """Создает презентацию по теме."""
+# Настройка Wikipedia API (важно: корректный user_agent!)
+wiki = wikipediaapi.Wikipedia(
+    language='ru',
+    user_agent='AbylaiPresentationBot/1.0 (https://t.me/YourBotUsername; contact: youremail@example.com)'
+)
+
+# Создание презентации PowerPoint
+def create_pptx(title: str, slides: list[str]) -> io.BytesIO:
     prs = Presentation()
-    prs.slide_width = Inches(16)
-    prs.slide_height = Inches(9)
-
-    # Заголовок
+    # Заглавный слайд
     slide_layout = prs.slide_layouts[0]
     slide = prs.slides.add_slide(slide_layout)
-    slide.shapes.title.text = topic
-    slide.placeholders[1].text = "Автоматически создано ботом"
+    slide.shapes.title.text = title
+    slide.placeholders[1].text = "Сгенерировано автоматически"
 
-    # Данные из Wikipedia
+    # Остальные слайды
+    for i, text in enumerate(slides, start=1):
+        slide_layout = prs.slide_layouts[1]
+        slide = prs.slides.add_slide(slide_layout)
+        slide.shapes.title.text = f"Слайд {i}"
+        slide.placeholders[1].text = text
+
+    # Сохраняем в память
+    output = io.BytesIO()
+    prs.save(output)
+    output.seek(0)
+    return output
+
+# Генерация презентации из Wikipedia
+async def generate_presentation(topic: str) -> io.BytesIO:
     page = wiki.page(topic)
     if not page.exists():
         return None
 
-    paragraphs = page.summary.split('. ')
-    chunks = [paragraphs[i:i + 3] for i in range(0, len(paragraphs), 3)]
+    # Берём первые 8 предложений
+    summary = page.summary.split('. ')
+    slides = summary[:8] if len(summary) > 8 else summary
+    return create_pptx(topic, slides)
 
-    for i in range(slides_count - 1):
-        slide_layout = prs.slide_layouts[1]
-        slide = prs.slides.add_slide(slide_layout)
-        slide.shapes.title.text = f"{topic} — часть {i+1}"
-        text = '. '.join(chunks[i]) if i < len(chunks) else "Нет дополнительной информации."
-        slide.placeholders[1].text = text
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as tmp:
-        prs.save(tmp.name)
-        return tmp.name
-
+# Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Привет! Я бот для создания презентаций.\n"
-        "Использование: /make <тема> [кол-во слайдов]\n"
-        "Пример: /make Французская революция 8"
-    )
+    await update.message.reply_text("Привет! Отправь мне тему, и я сделаю презентацию (.pptx) из Википедии.")
 
-async def make(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Укажи тему. Пример: /make Французская революция 8")
-        return
+# Генерация презентации по запросу пользователя
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    topic = update.message.text.strip()
+    await update.message.reply_text(f"Генерирую презентацию по теме: {topic}...")
 
-    try:
-        slides_count = int(context.args[-1])
-        topic = ' '.join(context.args[:-1])
-    except ValueError:
-        slides_count = 8
-        topic = ' '.join(context.args)
-
-    await update.message.reply_text(f"Создаю презентацию по теме: {topic} ({slides_count} слайдов)...")
-
-    pptx_path = create_presentation(topic, slides_count)
-    if pptx_path is None:
+    pptx_file = await generate_presentation(topic)
+    if pptx_file:
+        await update.message.reply_document(
+            document=pptx_file,
+            filename=f"{topic}.pptx",
+            caption=f"Вот презентация по теме: {topic}"
+        )
+    else:
         await update.message.reply_text("Не удалось найти информацию по этой теме.")
-        return
 
-    with open(pptx_path, 'rb') as file:
-        await update.message.reply_document(document=file, filename=f"{topic}.pptx")
-
-    os.remove(pptx_path)
-
-def main():
-    if not TOKEN:
-        raise ValueError("Токен не найден. Установи переменную окружения TOKEN.")
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("make", make))
-    app.run_polling()
-
+# Точка входа
 if __name__ == "__main__":
-    main()
+    if not TOKEN:
+        raise ValueError("Переменная окружения TOKEN не найдена. Укажи её в Railway Variables.")
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", start))
+    app.add_handler(CommandHandler("presentation", handle_message))
+    app.add_handler(CommandHandler("ppt", handle_message))
+
+    # Обработчик всех текстовых сообщений
+    from telegram.ext import MessageHandler, filters
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    logging.info("Бот запущен.")
+    app.run_polling()
